@@ -1,0 +1,12 @@
+[package]
+name = "broke-but-quick"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73.0"
+description = "Toy Message Broker over QUIC"
+authors = ["Conrad Ludgate <conradludgate@gmail.com>"]
+license = "AGPL-3.0-only"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
