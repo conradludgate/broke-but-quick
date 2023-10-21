@@ -10,3 +10,11 @@ license = "AGPL-3.0-only"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+quinn = "0.10.2"
+tokio = { version = "1.33.0", features = ["full", "macros"] }
+rustls = "0.21.7"
+ring = "0.17.5"
+rustls-pemfile = "1.0.3"
+
+[dev-dependencies]
+rcgen = "0.11.3"
