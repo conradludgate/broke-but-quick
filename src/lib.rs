@@ -1,7 +1,7 @@
 pub mod tls {
     use rustls::{
-        server::AllowAnyAuthenticatedClient, Certificate, ClientConfig, PrivateKey, RootCertStore,
-        ServerConfig,
+        server::AllowAnyAuthenticatedClient, version::TLS13, Certificate, ClientConfig, PrivateKey,
+        RootCertStore, ServerConfig,
     };
 
     fn ca_store(
@@ -22,7 +22,7 @@ pub mod tls {
         rustls::ClientConfig::builder()
             .with_safe_default_cipher_suites()
             .with_safe_default_kx_groups()
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(&[&TLS13])
             .unwrap()
             .with_root_certificates(ca_store(ca_certs)?)
             .with_client_auth_cert(client_certs.into_iter().collect(), private_key)
@@ -36,7 +36,7 @@ pub mod tls {
         rustls::ServerConfig::builder()
             .with_safe_default_cipher_suites()
             .with_safe_default_kx_groups()
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(&[&TLS13])
             .unwrap()
             .with_client_cert_verifier(
                 AllowAnyAuthenticatedClient::new(ca_store(ca_certs)?).boxed(),
