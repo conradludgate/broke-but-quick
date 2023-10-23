@@ -55,6 +55,7 @@ name = "broke-but-quick"
 version = "0.1.0"
 dependencies = [
  "quinn",
+ "quinn-proto",
  "rcgen",
  "ring 0.17.5",
  "rustls",
