@@ -22,8 +22,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let server = Endpoint::server(config, "0.0.0.0:6789".parse()?)?;
 
+    let exchange_name = "test-exchange".to_owned();
+    let queue_name1 = "test-queue1".to_owned();
+    let queue_name2 = "test-queue2".to_owned();
+
+    let route1 = "route1".to_owned();
+    let route2 = "route2".to_owned();
+
+    let exchange = ExchangesState {
+        routes: HashMap::from([
+            (route1, vec![queue_name1.clone()]),
+            (route2, vec![queue_name1.clone(), queue_name2.clone()]),
+        ]),
+    };
+
     let state = Arc::new(SharedState {
-        map: Mutex::new(HashMap::new()),
+        exchanges: HashMap::from([(exchange_name, exchange)]),
+        queues: HashMap::from([
+            (queue_name1, Mutex::default()),
+            (queue_name2, Mutex::default()),
+        ]),
     });
 
     while let Some(connecting) = server.accept().await {
@@ -33,8 +51,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+type ExchangeName = String;
+type Route = String;
+type QueueName = String;
+type Message = Vec<u8>;
+
 struct SharedState {
-    map: Mutex<HashMap<(String, String), Vec<Vec<u8>>>>,
+    exchanges: HashMap<ExchangeName, ExchangesState>,
+    queues: HashMap<QueueName, Mutex<Vec<MessageState>>>,
+}
+
+struct ExchangesState {
+    routes: HashMap<Route, Vec<QueueName>>,
+}
+
+#[derive(Clone)]
+struct MessageState {
+    id: uuid::Uuid,
+    inflight: bool,
+    payload: Message,
 }
 
 async fn handle_connection(state: Arc<SharedState>, connecting: Connecting) {
@@ -84,6 +119,7 @@ async fn handle_stream_inner(
 
     match header {
         broke_but_quick::PUBLISH => handle_stream_publish(state, send, recv).await?,
+        broke_but_quick::CONSUME => handle_stream_consume(state, send, recv).await?,
         _ => todo!(),
     }
 
@@ -97,7 +133,7 @@ async fn handle_stream_publish(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut total_len = [0; 8];
     recv.read_exact(&mut total_len).await?;
-    let total_len = dbg!(u64::from_be_bytes(total_len)) - 8;
+    let total_len = dbg!(u64::from_be_bytes(total_len));
 
     let payload = recv.read_to_end(total_len as usize).await?;
     let mut payload = payload.as_slice();
@@ -127,18 +163,103 @@ async fn handle_stream_publish(
 
     println!("{exchange} {routing_key} {message_str}");
 
-    {
-        let mut map = state.map.lock().await;
-
-        map.entry((exchange.to_owned(), routing_key.to_owned()))
-            .or_default()
-            .push(message.to_owned());
-
-        println!("map {map:?}");
+    let exchange = state.exchanges.get(exchange).ok_or("unknown exchange")?;
+    let queues = exchange.routes.get(routing_key).ok_or("unknown route")?;
+    for queue in queues {
+        state
+            .queues
+            .get(queue)
+            .unwrap()
+            .lock()
+            .await
+            .push(MessageState {
+                id: uuid::Uuid::new_v4(),
+                inflight: false,
+                payload: message.to_owned(),
+            });
     }
 
     send.write_all(&[1]).await?;
     send.finish().await?;
+
+    Ok(())
+}
+
+async fn handle_stream_consume(
+    state: Arc<SharedState>,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut queue_len = [0; 8];
+    recv.read_exact(&mut queue_len).await?;
+    let queue_len = dbg!(u64::from_be_bytes(queue_len));
+    let mut queue = vec![0; queue_len as usize];
+    recv.read_exact(&mut queue).await?;
+    let queue = String::from_utf8(queue)?;
+    dbg!(&queue);
+
+    let message = state
+        .queues
+        .get(&queue)
+        .unwrap()
+        .lock()
+        .await
+        .iter_mut()
+        .find(|m| !m.inflight)
+        .map(|m| {
+            m.inflight = true;
+            m
+        })
+        .cloned();
+
+    let Some(message) = message else {
+        send.write_all(&[0]).await?;
+        return Ok(());
+    };
+
+    let message_id = message.id;
+
+    send.write_all(&[1]).await?;
+
+    // let total_len = message.payload.len() + 16 + 8;
+
+    // send.write_all(&(total_len as u64).to_be_bytes()).await?;
+
+    // send.write_all(message.id.as_bytes()).await?;
+    // send.finish().await?;
+
+    send.write_all(&(message.payload.len() as u64).to_be_bytes())
+        .await?;
+    send.write_all(&message.payload).await?;
+    send.finish().await?;
+
+    // let mut message_id = [0; 16];
+    // recv.read_exact(&mut message_id).await?;
+    // let message_id = uuid::Uuid::from_bytes(message_id);
+
+    let mut confirm = [0];
+    recv.read_exact(&mut confirm).await?;
+
+    let mut queue = state.queues.get(&queue).unwrap().lock().await;
+    let (idx, message) = queue
+        .iter_mut()
+        .enumerate()
+        .find(|m| m.1.id == message_id)
+        .ok_or("invalid message")?;
+
+    dbg!(confirm);
+
+    match confirm[0] {
+        0 => {
+            queue.remove(idx);
+        }
+        1 => message.inflight = false,
+        // DLQ
+        2 => {
+            queue.remove(idx);
+        }
+        _ => return Err("invalid ack code".into()),
+    }
 
     Ok(())
 }

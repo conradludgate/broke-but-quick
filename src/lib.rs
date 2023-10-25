@@ -1,8 +1,9 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use quinn::Endpoint;
+use quinn::{Endpoint, SendStream};
 use quinn_proto::ClientConfig;
 use rustls::{Certificate, PrivateKey};
+use tokio::io::AsyncWriteExt;
 
 pub mod tls {
     use rustls::{
@@ -102,7 +103,7 @@ impl Connection {
         let (mut send, mut recv) = self.inner.open_bi().await?;
 
         send.write_all(&PUBLISH).await?;
-        let entire_length = exchange.len() + routing_key.len() + message.len() + 4 * 8;
+        let entire_length = exchange.len() + routing_key.len() + message.len() + 3 * 8;
         send.write_all(&(entire_length as u64).to_be_bytes())
             .await?;
         send.write_all(&(exchange.len() as u64).to_be_bytes())
@@ -123,6 +124,62 @@ impl Connection {
             return Err(format!("unconfirmed {confirm:?}").into());
         }
 
+        Ok(())
+    }
+
+    pub async fn consume(
+        &self,
+        queue: &str,
+    ) -> Result<Option<Message>, Box<dyn std::error::Error>> {
+        let (mut send, mut recv) = self.inner.open_bi().await?;
+        dbg!("consuming");
+
+        send.write_all(&CONSUME).await?;
+        send.write_all(&(queue.len() as u64).to_be_bytes()).await?;
+        send.write_all(queue.as_bytes()).await?;
+        send.flush().await?;
+
+        dbg!("sent");
+
+        let mut confirm = [0];
+        recv.read_exact(&mut confirm).await?;
+
+        if confirm != [1] {
+            return Ok(None);
+        }
+
+        // let mut message_id = [0; 16];
+        // recv.read_exact(&mut message_id).await?;
+
+        let mut payload_len = [0; 8];
+        recv.read_exact(&mut payload_len).await?;
+        let payload_len = dbg!(u64::from_be_bytes(payload_len));
+
+        let payload = recv.read_to_end(payload_len as usize).await?;
+
+        Ok(Some(Message { payload, send }))
+    }
+}
+
+pub struct Message {
+    pub payload: Vec<u8>,
+    send: SendStream,
+}
+
+#[repr(u8)]
+pub enum MessageAck {
+    Ack = 0,
+    Nack = 1,
+    Reject = 2,
+}
+
+impl Message {
+    pub async fn message_ack(
+        mut self,
+        ack_code: MessageAck,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.send.write_all(&[ack_code as u8]).await?;
+        self.send.finish().await?;
         Ok(())
     }
 }

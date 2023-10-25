@@ -20,7 +20,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    conn.publish("test-exchange", "test-key2", "hello world".as_bytes())
+    conn.publish("test-exchange", "route2", "hello world".as_bytes())
+        .await?;
+
+    conn.publish("test-exchange", "route2", "hello world2".as_bytes())
+        .await?;
+
+    let message1 = conn.consume("test-queue2").await?.unwrap();
+    println!("{}", String::from_utf8_lossy(&message1.payload));
+
+    let message2 = conn.consume("test-queue2").await?.unwrap();
+    println!("{}", String::from_utf8_lossy(&message2.payload));
+
+    message2
+        .message_ack(broke_but_quick::MessageAck::Ack)
+        .await?;
+
+    message1
+        .message_ack(broke_but_quick::MessageAck::Nack)
+        .await?;
+
+    let message1 = conn.consume("test-queue2").await?.unwrap();
+    println!("{}", String::from_utf8_lossy(&message1.payload));
+
+    message1
+        .message_ack(broke_but_quick::MessageAck::Ack)
         .await?;
 
     Ok(())
