@@ -6,6 +6,10 @@ use std::{
     sync::Arc,
 };
 
+use broke_but_quick::{
+    read_message, read_message_fixed, write_message, write_message_fixed, Consume, MessageAck,
+    OpenMessage, Publish, PublishConfirm,
+};
 use quinn::{Connecting, Endpoint, RecvStream, SendStream, ServerConfig};
 use sled::transaction::{ConflictableTransactionError, TransactionError};
 use tokio::sync::{Mutex, Notify};
@@ -159,13 +163,13 @@ async fn handle_stream_inner(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("new stream {}", send.id());
 
-    let mut header = [0; 4];
-    recv.read_exact(&mut header).await?;
+    let message = read_message::<OpenMessage>(&mut recv).await?;
 
-    match header {
-        broke_but_quick::PUBLISH => handle_stream_publish(state, send, recv).await?,
-        broke_but_quick::CONSUME => handle_stream_consume(state, conn_state, send, recv).await?,
-        _ => todo!(),
+    match message.get() {
+        OpenMessage::Publish(publish) => handle_stream_publish(state, send, publish).await?,
+        OpenMessage::Consume(consume) => {
+            handle_stream_consume(state, conn_state, send, recv, consume).await?
+        }
     }
 
     Ok(())
@@ -174,36 +178,13 @@ async fn handle_stream_inner(
 async fn handle_stream_publish(
     state: Arc<SharedState>,
     mut send: SendStream,
-    mut recv: RecvStream,
+    publish: &Publish<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut total_len = [0; 8];
-    recv.read_exact(&mut total_len).await?;
-    let total_len = dbg!(u64::from_be_bytes(total_len));
-
-    let payload = recv.read_to_end(total_len as usize).await?;
-    let mut payload = payload.as_slice();
-
-    let (len, rest) = payload.split_at(8);
-    let exchange_len = u64::from_be_bytes(len.try_into().unwrap());
-    let (exchange, rest) = rest.split_at(dbg!(exchange_len) as usize);
-    let exchange = std::str::from_utf8(exchange)?;
-    payload = rest;
-
-    let (len, rest) = payload.split_at(8);
-    let routing_len = u64::from_be_bytes(len.try_into().unwrap());
-    let (routing_key, rest) = rest.split_at(dbg!(routing_len) as usize);
-    let routing_key = std::str::from_utf8(routing_key)?;
-    payload = rest;
-
-    let (len, rest) = payload.split_at(8);
-    let message_len = u64::from_be_bytes(len.try_into().unwrap());
-    let (message, rest) = rest.split_at(dbg!(message_len) as usize);
-    payload = rest;
-
-    if !payload.is_empty() {
-        return Err("invalid payload".into());
-    }
-
+    let Publish {
+        exchange,
+        routing_key,
+        message,
+    } = *publish;
     let message_str = String::from_utf8_lossy(message);
 
     println!("{exchange} {routing_key} {message_str}");
@@ -237,7 +218,7 @@ async fn handle_stream_publish(
         println!("{}", String::from_utf8_lossy(&key));
     }
 
-    send.write_all(&[1]).await?;
+    write_message_fixed(&PublishConfirm::Ack, &mut send, &mut [0; 1]).await?;
     send.finish().await?;
 
     Ok(())
@@ -248,13 +229,9 @@ async fn handle_stream_consume(
     conn_state: Arc<ConnectionState>,
     mut send: SendStream,
     mut recv: RecvStream,
+    consume: &Consume<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut queue_len = [0; 8];
-    recv.read_exact(&mut queue_len).await?;
-    let queue_len = dbg!(u64::from_be_bytes(queue_len));
-    let mut queue_name = vec![0; queue_len as usize];
-    recv.read_exact(&mut queue_name).await?;
-    let queue_name = String::from_utf8(queue_name)?;
+    let queue_name = consume.queue;
     dbg!(&queue_name);
 
     let acquired = state.db.open_tree("acquired")?;
@@ -299,7 +276,7 @@ async fn handle_stream_consume(
         println!("acquired {}", String::from_utf8_lossy(&key));
     }
 
-    let queue = state.queues.get(&queue_name).unwrap();
+    let queue = state.queues.get(queue_name).unwrap();
     let message = loop {
         let mut notified = pin!(queue.notify.notified());
         notified.as_mut().enable();
@@ -311,7 +288,7 @@ async fn handle_stream_consume(
 
         match message {
             Some(message) => {
-                conn_state.insert((queue_name.clone(), message.id));
+                conn_state.insert((queue_name.to_owned(), message.id));
                 dbg!(&conn_state);
                 message.inflight = true;
 
@@ -325,14 +302,10 @@ async fn handle_stream_consume(
     };
 
     let message_id = message.id;
-
-    send.write_all(&dbg!(message.payload.len() as u64).to_be_bytes())
-        .await?;
-    send.write_all(&message.payload).await?;
+    write_message(&*message.payload, &mut send).await?;
     send.finish().await?;
 
-    let mut confirm = [0];
-    recv.read_exact(&mut confirm).await?;
+    let confirm: MessageAck = read_message_fixed(&mut recv, &mut [0; 1]).await?;
 
     let mut conn_state = conn_state.messages.lock().await;
     let mut messages = queue.messages.lock().await;
@@ -342,21 +315,18 @@ async fn handle_stream_consume(
         .find(|m| m.1.id == message_id)
         .ok_or("invalid message")?;
 
-    dbg!(confirm);
-
-    match confirm[0] {
-        0 => {
+    match dbg!(confirm) {
+        MessageAck::Ack => {
             messages.remove(idx);
         }
-        1 => message.inflight = false,
+        MessageAck::Nack => message.inflight = false,
         // DLQ
-        2 => {
+        MessageAck::Reject => {
             messages.remove(idx);
         }
-        _ => return Err("invalid ack code".into()),
     }
 
-    conn_state.remove(&(queue_name, message_id));
+    conn_state.remove(&(queue_name.to_owned(), message_id));
     dbg!(&conn_state);
 
     Ok(())

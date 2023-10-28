@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("consuming");
 
         let message1 = conn2.consume("test-queue2").await.unwrap();
-        println!("{}", String::from_utf8_lossy(&message1.payload));
+        println!("{}", String::from_utf8_lossy(&message1));
 
         message1
             .message_ack(broke_but_quick::MessageAck::Ack)
