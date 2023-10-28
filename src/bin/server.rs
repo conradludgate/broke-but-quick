@@ -7,6 +7,7 @@ use std::{
 };
 
 use quinn::{Connecting, Endpoint, RecvStream, SendStream, ServerConfig};
+use sled::transaction::{ConflictableTransactionError, TransactionError};
 use tokio::sync::{Mutex, Notify};
 
 #[tokio::main]
@@ -28,6 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let server = Endpoint::server(config, "0.0.0.0:6789".parse()?)?;
 
+    let db: sled::Db = sled::Config::new().path("bbq").open()?;
+
     let exchange_name = "test-exchange".to_owned();
     let queue_name1 = "test-queue1".to_owned();
     let queue_name2 = "test-queue2".to_owned();
@@ -48,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (queue_name1, QueueState::default()),
             (queue_name2, QueueState::default()),
         ]),
+        db,
     });
 
     while let Some(connecting) = server.accept().await {
@@ -65,6 +69,7 @@ type Message = Vec<u8>;
 struct SharedState {
     exchanges: HashMap<ExchangeName, ExchangesState>,
     queues: HashMap<QueueName, QueueState>,
+    db: sled::Db,
 }
 
 struct ExchangesState {
@@ -206,15 +211,30 @@ async fn handle_stream_publish(
     let exchange = state.exchanges.get(exchange).ok_or("unknown exchange")?;
     let queues = exchange.routes.get(routing_key).ok_or("unknown route")?;
     for queue in queues {
+        let message_id = uuid::Uuid::new_v4();
+
+        let mut key = Vec::new();
+        key.extend_from_slice(queue.as_bytes());
+        key.extend_from_slice(&[0]);
+        key.extend_from_slice(message_id.as_bytes());
+
+        state.db.insert(key, message)?;
+        state.db.flush_async().await?;
+
         let queue = state.queues.get(queue).unwrap();
 
         queue.messages.lock().await.push(MessageState {
-            id: uuid::Uuid::new_v4(),
+            id: message_id,
             inflight: false,
             payload: message.to_owned(),
         });
 
         queue.notify.notify_one();
+    }
+
+    for entry in state.db.iter() {
+        let (key, _) = entry?;
+        println!("{}", String::from_utf8_lossy(&key));
     }
 
     send.write_all(&[1]).await?;
@@ -236,6 +256,48 @@ async fn handle_stream_consume(
     recv.read_exact(&mut queue_name).await?;
     let queue_name = String::from_utf8(queue_name)?;
     dbg!(&queue_name);
+
+    let acquired = state.db.open_tree("acquired")?;
+
+    let mut key = Vec::new();
+    key.extend_from_slice(queue_name.as_bytes());
+    key.extend_from_slice(&[0]);
+
+    use sled::transaction::Transactional;
+    let res = (&*state.db, &acquired).transaction(|(message, acquired)| {
+        if let Some(entry) = state.db.range((&*key)..).next() {
+            let (key2, value) = entry?;
+            if let Some(id) = key2.strip_prefix(&*key) {
+                let message_id = uuid::Uuid::from_bytes(id.try_into().unwrap());
+                dbg!(message_id);
+
+                let message = message.remove(&key2)?.unwrap();
+                acquired.insert(&key2, message)?;
+                Ok((message_id, value))
+            } else {
+                Err(ConflictableTransactionError::Abort(()))
+            }
+        } else {
+            Err(ConflictableTransactionError::Abort(()))
+        }
+    });
+
+    match res {
+        Ok((message_id, value)) => {
+            println!("{message_id} {}", String::from_utf8_lossy(&value));
+        }
+        Err(TransactionError::Abort(())) => return Err("abort".into()),
+        Err(TransactionError::Storage(e)) => return Err(e.into()),
+    }
+
+    for entry in state.db.iter() {
+        let (key, _) = entry?;
+        println!("entry {}", String::from_utf8_lossy(&key));
+    }
+    for entry in acquired.iter() {
+        let (key, _) = entry?;
+        println!("acquired {}", String::from_utf8_lossy(&key));
+    }
 
     let queue = state.queues.get(&queue_name).unwrap();
     let message = loop {
