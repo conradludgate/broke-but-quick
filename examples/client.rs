@@ -1,4 +1,4 @@
-use std::{fs::File, io::BufReader};
+use std::{fs::File, io::BufReader, sync::Arc, time::Duration};
 
 use broke_but_quick::Connection;
 
@@ -20,32 +20,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
+    let conn = Arc::new(conn);
+    let conn2 = Arc::clone(&conn);
+
+    let handle = tokio::spawn(async move {
+        println!("consuming");
+
+        let message1 = conn2.consume("test-queue2").await.unwrap();
+        println!("{}", String::from_utf8_lossy(&message1.payload));
+
+        message1
+            .message_ack(broke_but_quick::MessageAck::Ack)
+            .await
+            .unwrap();
+    });
+
     conn.publish("test-exchange", "route2", "hello world".as_bytes())
         .await?;
 
-    conn.publish("test-exchange", "route2", "hello world2".as_bytes())
-        .await?;
-
-    let message1 = conn.consume("test-queue2").await?.unwrap();
-    println!("{}", String::from_utf8_lossy(&message1.payload));
-
-    let message2 = conn.consume("test-queue2").await?.unwrap();
-    println!("{}", String::from_utf8_lossy(&message2.payload));
-
-    message2
-        .message_ack(broke_but_quick::MessageAck::Ack)
-        .await?;
-
-    message1
-        .message_ack(broke_but_quick::MessageAck::Nack)
-        .await?;
-
-    let message1 = conn.consume("test-queue2").await?.unwrap();
-    println!("{}", String::from_utf8_lossy(&message1.payload));
-
-    message1
-        .message_ack(broke_but_quick::MessageAck::Ack)
-        .await?;
+    handle.await?;
 
     Ok(())
 }

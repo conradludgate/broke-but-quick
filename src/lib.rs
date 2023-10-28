@@ -127,10 +127,7 @@ impl Connection {
         Ok(())
     }
 
-    pub async fn consume(
-        &self,
-        queue: &str,
-    ) -> Result<Option<Message>, Box<dyn std::error::Error>> {
+    pub async fn consume(&self, queue: &str) -> Result<Message, Box<dyn std::error::Error>> {
         let (mut send, mut recv) = self.inner.open_bi().await?;
         dbg!("consuming");
 
@@ -141,23 +138,13 @@ impl Connection {
 
         dbg!("sent");
 
-        let mut confirm = [0];
-        recv.read_exact(&mut confirm).await?;
-
-        if confirm != [1] {
-            return Ok(None);
-        }
-
-        // let mut message_id = [0; 16];
-        // recv.read_exact(&mut message_id).await?;
-
         let mut payload_len = [0; 8];
         recv.read_exact(&mut payload_len).await?;
         let payload_len = dbg!(u64::from_be_bytes(payload_len));
 
         let payload = recv.read_to_end(payload_len as usize).await?;
 
-        Ok(Some(Message { payload, send }))
+        Ok(Message { payload, send })
     }
 }
 

@@ -1,7 +1,13 @@
-use std::{collections::HashMap, fs::File, io::BufReader, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::File,
+    io::BufReader,
+    pin::pin,
+    sync::Arc,
+};
 
 use quinn::{Connecting, Endpoint, RecvStream, SendStream, ServerConfig};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,8 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(SharedState {
         exchanges: HashMap::from([(exchange_name, exchange)]),
         queues: HashMap::from([
-            (queue_name1, Mutex::default()),
-            (queue_name2, Mutex::default()),
+            (queue_name1, QueueState::default()),
+            (queue_name2, QueueState::default()),
         ]),
     });
 
@@ -58,11 +64,21 @@ type Message = Vec<u8>;
 
 struct SharedState {
     exchanges: HashMap<ExchangeName, ExchangesState>,
-    queues: HashMap<QueueName, Mutex<Vec<MessageState>>>,
+    queues: HashMap<QueueName, QueueState>,
 }
 
 struct ExchangesState {
     routes: HashMap<Route, Vec<QueueName>>,
+}
+
+#[derive(Default)]
+struct QueueState {
+    notify: Notify,
+    messages: Mutex<Vec<MessageState>>,
+}
+
+struct ConnectionState {
+    messages: Mutex<HashSet<(QueueName, uuid::Uuid)>>,
 }
 
 #[derive(Clone)]
@@ -90,16 +106,39 @@ async fn handle_connection_inner(
     let connection = connecting.await?;
     println!("connection established {:?}", connection.rtt());
 
+    let conn_state = Arc::new(ConnectionState {
+        messages: Mutex::default(),
+    });
+
     loop {
-        let (send, recv) = connection.accept_bi().await?;
-        tokio::spawn(handle_stream(state.clone(), send, recv));
+        match connection.accept_bi().await {
+            Ok((send, recv)) => {
+                tokio::spawn(handle_stream(state.clone(), conn_state.clone(), send, recv))
+            }
+            Err(e) => {
+                for (queue_name, message_id) in conn_state.messages.lock().await.drain() {
+                    let queue = state.queues.get(&queue_name).unwrap();
+                    let mut message_lock = queue.messages.lock().await;
+                    if let Some(message) = message_lock.iter_mut().find(|m| m.id == message_id) {
+                        message.inflight = false;
+                    }
+                }
+
+                return Err(e.into());
+            }
+        };
 
         println!("connection continue {:?}", connection.rtt());
     }
 }
 
-async fn handle_stream(state: Arc<SharedState>, send: SendStream, recv: RecvStream) {
-    match handle_stream_inner(state, send, recv).await {
+async fn handle_stream(
+    state: Arc<SharedState>,
+    conn_state: Arc<ConnectionState>,
+    send: SendStream,
+    recv: RecvStream,
+) {
+    match handle_stream_inner(state, conn_state, send, recv).await {
         Ok(()) => {}
         Err(e) => {
             eprintln!("error handling stream {e:?}");
@@ -109,6 +148,7 @@ async fn handle_stream(state: Arc<SharedState>, send: SendStream, recv: RecvStre
 
 async fn handle_stream_inner(
     state: Arc<SharedState>,
+    conn_state: Arc<ConnectionState>,
     send: SendStream,
     mut recv: RecvStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -119,7 +159,7 @@ async fn handle_stream_inner(
 
     match header {
         broke_but_quick::PUBLISH => handle_stream_publish(state, send, recv).await?,
-        broke_but_quick::CONSUME => handle_stream_consume(state, send, recv).await?,
+        broke_but_quick::CONSUME => handle_stream_consume(state, conn_state, send, recv).await?,
         _ => todo!(),
     }
 
@@ -166,17 +206,15 @@ async fn handle_stream_publish(
     let exchange = state.exchanges.get(exchange).ok_or("unknown exchange")?;
     let queues = exchange.routes.get(routing_key).ok_or("unknown route")?;
     for queue in queues {
-        state
-            .queues
-            .get(queue)
-            .unwrap()
-            .lock()
-            .await
-            .push(MessageState {
-                id: uuid::Uuid::new_v4(),
-                inflight: false,
-                payload: message.to_owned(),
-            });
+        let queue = state.queues.get(queue).unwrap();
+
+        queue.messages.lock().await.push(MessageState {
+            id: uuid::Uuid::new_v4(),
+            inflight: false,
+            payload: message.to_owned(),
+        });
+
+        queue.notify.notify_one();
     }
 
     send.write_all(&[1]).await?;
@@ -187,61 +225,56 @@ async fn handle_stream_publish(
 
 async fn handle_stream_consume(
     state: Arc<SharedState>,
+    conn_state: Arc<ConnectionState>,
     mut send: SendStream,
     mut recv: RecvStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut queue_len = [0; 8];
     recv.read_exact(&mut queue_len).await?;
     let queue_len = dbg!(u64::from_be_bytes(queue_len));
-    let mut queue = vec![0; queue_len as usize];
-    recv.read_exact(&mut queue).await?;
-    let queue = String::from_utf8(queue)?;
-    dbg!(&queue);
+    let mut queue_name = vec![0; queue_len as usize];
+    recv.read_exact(&mut queue_name).await?;
+    let queue_name = String::from_utf8(queue_name)?;
+    dbg!(&queue_name);
 
-    let message = state
-        .queues
-        .get(&queue)
-        .unwrap()
-        .lock()
-        .await
-        .iter_mut()
-        .find(|m| !m.inflight)
-        .map(|m| {
-            m.inflight = true;
-            m
-        })
-        .cloned();
+    let queue = state.queues.get(&queue_name).unwrap();
+    let message = loop {
+        let mut notified = pin!(queue.notify.notified());
+        notified.as_mut().enable();
 
-    let Some(message) = message else {
-        send.write_all(&[0]).await?;
-        return Ok(());
+        let mut conn_state = conn_state.messages.lock().await;
+        let mut message_lock = queue.messages.lock().await;
+
+        let message = message_lock.iter_mut().find(|m| !m.inflight);
+
+        match message {
+            Some(message) => {
+                conn_state.insert((queue_name.clone(), message.id));
+                dbg!(&conn_state);
+                message.inflight = true;
+
+                break message.clone();
+            }
+            None => {
+                drop(message_lock);
+                notified.await
+            }
+        };
     };
 
     let message_id = message.id;
 
-    send.write_all(&[1]).await?;
-
-    // let total_len = message.payload.len() + 16 + 8;
-
-    // send.write_all(&(total_len as u64).to_be_bytes()).await?;
-
-    // send.write_all(message.id.as_bytes()).await?;
-    // send.finish().await?;
-
-    send.write_all(&(message.payload.len() as u64).to_be_bytes())
+    send.write_all(&dbg!(message.payload.len() as u64).to_be_bytes())
         .await?;
     send.write_all(&message.payload).await?;
     send.finish().await?;
 
-    // let mut message_id = [0; 16];
-    // recv.read_exact(&mut message_id).await?;
-    // let message_id = uuid::Uuid::from_bytes(message_id);
-
     let mut confirm = [0];
     recv.read_exact(&mut confirm).await?;
 
-    let mut queue = state.queues.get(&queue).unwrap().lock().await;
-    let (idx, message) = queue
+    let mut conn_state = conn_state.messages.lock().await;
+    let mut messages = queue.messages.lock().await;
+    let (idx, message) = messages
         .iter_mut()
         .enumerate()
         .find(|m| m.1.id == message_id)
@@ -251,15 +284,18 @@ async fn handle_stream_consume(
 
     match confirm[0] {
         0 => {
-            queue.remove(idx);
+            messages.remove(idx);
         }
         1 => message.inflight = false,
         // DLQ
         2 => {
-            queue.remove(idx);
+            messages.remove(idx);
         }
         _ => return Err("invalid ack code".into()),
     }
+
+    conn_state.remove(&(queue_name, message_id));
+    dbg!(&conn_state);
 
     Ok(())
 }
