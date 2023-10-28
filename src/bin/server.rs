@@ -6,10 +6,10 @@ use std::{
     sync::Arc,
 };
 
-use broke_but_quick::{
-    read_message, read_message_fixed, write_message, write_message_fixed, Consume, MessageAck,
-    OpenMessage, Publish, PublishConfirm,
+use broke_but_quick::encoding::{
+    read_message, read_message_fixed, write_message, write_message_fixed,
 };
+use broke_but_quick::{Consume, MessageAck, OpenMessage, Publish, PublishConfirm};
 use quinn::{Connecting, Endpoint, RecvStream, SendStream, ServerConfig};
 use sled::transaction::{ConflictableTransactionError, TransactionError};
 use tokio::sync::{Mutex, Notify};

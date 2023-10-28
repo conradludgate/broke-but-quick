@@ -2,66 +2,18 @@
 #![allow(clippy::forget_non_drop)]
 use std::{net::SocketAddr, ops::Deref, sync::Arc};
 
-use bincode::Options;
+use encoding::{read_message_fixed, write_message_fixed};
 use quinn::{Endpoint, SendStream};
 use quinn_proto::ClientConfig;
 use rustls::{Certificate, PrivateKey};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use yoke::{Yoke, Yokeable};
 
-pub mod tls {
-    use rustls::{
-        server::AllowAnyAuthenticatedClient, version::TLS13, Certificate, ClientConfig, PrivateKey,
-        RootCertStore, ServerConfig,
-    };
+use crate::encoding::{read_message, write_message};
 
-    fn ca_store(
-        ca_certs: impl IntoIterator<Item = Certificate>,
-    ) -> Result<RootCertStore, rustls::Error> {
-        let mut ca_store = RootCertStore::empty();
-        for cert in ca_certs {
-            ca_store.add(&cert)?;
-        }
-        Ok(ca_store)
-    }
-
-    pub fn client(
-        private_key: PrivateKey,
-        client_certs: impl IntoIterator<Item = Certificate>,
-        ca_certs: impl IntoIterator<Item = Certificate>,
-    ) -> Result<ClientConfig, rustls::Error> {
-        let mut config = rustls::ClientConfig::builder()
-            .with_safe_default_cipher_suites()
-            .with_safe_default_kx_groups()
-            .with_protocol_versions(&[&TLS13])
-            .unwrap()
-            .with_root_certificates(ca_store(ca_certs)?)
-            .with_client_auth_cert(client_certs.into_iter().collect(), private_key)?;
-
-        config.alpn_protocols = vec![b"bbq".to_vec()];
-        Ok(config)
-    }
-
-    pub fn server(
-        private_key: PrivateKey,
-        server_certs: impl IntoIterator<Item = Certificate>,
-        ca_certs: impl IntoIterator<Item = Certificate>,
-    ) -> Result<ServerConfig, rustls::Error> {
-        let mut config = rustls::ServerConfig::builder()
-            .with_safe_default_cipher_suites()
-            .with_safe_default_kx_groups()
-            .with_protocol_versions(&[&TLS13])
-            .unwrap()
-            .with_client_cert_verifier(
-                AllowAnyAuthenticatedClient::new(ca_store(ca_certs)?).boxed(),
-            )
-            .with_single_cert(server_certs.into_iter().collect(), private_key)?;
-
-        config.alpn_protocols = vec![b"bbq".to_vec()];
-        Ok(config)
-    }
-}
+pub mod encoding;
+pub mod tls;
 
 pub struct Connection {
     inner: quinn::Connection,
@@ -87,68 +39,16 @@ pub struct Consume<'a> {
     pub queue: &'a str,
 }
 
-pub const PUBLISH: [u8; 4] = *b"SEND";
-pub const CONSUME: [u8; 4] = *b"RECV";
-
-pub fn options() -> impl Options {
-    bincode::DefaultOptions::new()
-        .with_little_endian()
-        .with_varint_encoding()
-        .reject_trailing_bytes()
-        .with_no_limit()
+#[derive(Serialize, Deserialize, Yokeable, Debug)]
+pub enum MessageAck {
+    Ack,
+    Nack,
+    Reject,
 }
 
-pub async fn write_message(
-    t: &(impl Serialize + ?Sized),
-    w: &mut (impl AsyncWrite + Unpin),
-) -> Result<(), Box<dyn std::error::Error>> {
-    let message = options().serialize(t)?;
-    w.write_all(&(message.len() as u64).to_le_bytes()).await?;
-    w.write_all(&message).await?;
-    Ok(())
-}
-
-/// writes a message of a fixed known size into the buffer
-///
-/// # Panics:
-/// Panics if the size of the buffer is wrong (eg, not fixed)
-pub async fn write_message_fixed(
-    t: &(impl Serialize + ?Sized),
-    w: &mut (impl AsyncWrite + Unpin),
-    buf: &mut [u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let len = options().serialized_size(t)?;
-    debug_assert_eq!(buf.len(), len as usize, "buffer len did not match");
-    options().serialize_into(&mut *buf, t)?;
-    w.write_all(buf).await?;
-    Ok(())
-}
-
-pub async fn read_message<T>(
-    r: &mut (impl AsyncRead + Unpin),
-) -> Result<Yoke<T, Vec<u8>>, Box<dyn std::error::Error>>
-where
-    T: for<'a> Yokeable<'a>,
-    for<'de> <T as yoke::Yokeable<'de>>::Output: Deserialize<'de>,
-{
-    let mut payload_len = [0; 8];
-    r.read_exact(&mut payload_len).await?;
-    let payload_len = dbg!(u64::from_le_bytes(payload_len));
-
-    let mut payload = vec![0; payload_len as usize];
-    r.read_exact(&mut payload).await?;
-
-    Ok(Yoke::try_attach_to_cart(payload, |bytes| {
-        options().deserialize(bytes)
-    })?)
-}
-
-pub async fn read_message_fixed<'de, T: Deserialize<'de>>(
-    r: &mut (impl AsyncRead + Unpin),
-    buf: &'de mut [u8],
-) -> Result<T, Box<dyn std::error::Error>> {
-    r.read_exact(buf).await?;
-    Ok(options().deserialize(buf)?)
+#[derive(Serialize, Deserialize, Yokeable, Debug)]
+pub enum PublishConfirm {
+    Ack,
 }
 
 impl Connection {
@@ -229,13 +129,6 @@ impl Deref for Message {
     }
 }
 
-#[derive(Serialize, Deserialize, Yokeable, Debug)]
-pub enum MessageAck {
-    Ack,
-    Nack,
-    Reject,
-}
-
 impl Message {
     pub async fn message_ack(
         mut self,
@@ -245,9 +138,4 @@ impl Message {
         self.send.finish().await?;
         Ok(())
     }
-}
-
-#[derive(Serialize, Deserialize, Yokeable, Debug)]
-pub enum PublishConfirm {
-    Ack,
 }
